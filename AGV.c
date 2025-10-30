@@ -147,6 +147,10 @@ typedef enum {
 #define MAX_TASKS 50
 #define MAX_SPEED_MULTIPLIER 10000.0f
 #define EVENT_GENERATION_INTERVAL 10
+// 정리 단계에서 강제 유휴화를 적용하기 전 대기할 스텝 수
+#ifndef CLEANUP_FORCE_IDLE_AFTER_STEPS
+#define CLEANUP_FORCE_IDLE_AFTER_STEPS 11
+#endif
 
 /**
  * @brief UI 버퍼 관련 상수
@@ -174,14 +178,6 @@ typedef enum {
 #ifndef RENDER_STRIDE_MIN
 #define RENDER_STRIDE_MIN 1
 #endif
-
-/**
- * @brief WHCA* 호라이즌 설정(최소/최대/초기값)
- */
- // --- WHCA* 호라이즌 설정 ---
-#define MIN_WHCA_HORIZON 1
-#define MAX_WHCA_HORIZON 4
-static int g_whca_horizon = 2;
 
 /**
  * @brief 작업/우선순위/교착 가중치 설정
@@ -213,17 +209,25 @@ static int g_whca_horizon = 2;
  * @brief 교착 상태 판단 임계치 설정(stuck 연속 틱 수)
  */
  // --- 교착 상태 처리 ---
-#define DEADLOCK_THRESHOLD 4
+#define DEADLOCK_THRESHOLD 5
+
+/**
+ * @brief WHCA* 호라이즌 설정(최소/최대/초기값)
+ */
+ // --- WHCA* 호라이즌 설정 ---
+#define MIN_WHCA_HORIZON 5
+#define MAX_WHCA_HORIZON 11
+static int g_whca_horizon = 5;
 
 /**
  * @brief 대기 그래프(WFG) 및 Partial CBS 관련 한도 설정
  */
- // --- WFG 및 CBS 매개변수 ---
-#define MAX_WAIT_EDGES 2
-#define MAX_CBS_GROUP  3
-#define MAX_CBS_CONS   2
-#define MAX_CBS_NODES  4
-#define CBS_MAX_EXPANSIONS 2
+ // --- WFG 및 CBS 매개변수 
+#define MAX_WAIT_EDGES 64
+#define MAX_CBS_GROUP  5
+#define MAX_CBS_CONS   64
+#define MAX_CBS_NODES  128
+#define CBS_MAX_EXPANSIONS 64
 
 /**
  * @brief ST-A*용 정적 버퍼 인덱스 상한 (메모리 선할당 크기)
@@ -301,6 +305,8 @@ typedef struct {
 
 // Pathfinder 구조체 전방 선언
 struct Pathfinder_;
+struct Agent_;  // Agent 전방 선언
+typedef struct Agent_ Agent;  // Agent 타입 별칭
 // D* Lite 알고리즘의 인스턴스를 관리하는 구조체 (에이전트별로 소유)
 typedef struct Pathfinder_ {
     NodePQ pq;                                  // 우선순위 큐 (open list)
@@ -309,6 +315,7 @@ typedef struct Pathfinder_ {
     Node* goal_node;                            // 최종 목표 위치 (t, rhs=0)
     Node* last_start;                           // 이전 스텝의 시작 위치 (km 계산용)
     double km;                                  // D* Lite의 키 수정자 (key modifier)
+    const struct Agent_* agent;                 // 이 Pathfinder를 소유한 에이전트 (블록 체크용)
 } Pathfinder;
 
 // --- WHCA* 시간 확장 예약 테이블 ---
@@ -364,7 +371,7 @@ static inline int dir_turn_steps(AgentDir from, AgentDir to) {
 // --- 이동 및 기하 헬퍼 (통합) ---
 // 회전 대기 시간 (90도 회전 시 총 대기 틱)
 #ifndef TURN_90_WAIT
-#define TURN_90_WAIT 4
+#define TURN_90_WAIT 2
 #endif
 
 // 4방향 기본 오프셋 (상단 정렬)
@@ -422,7 +429,7 @@ static inline void temp_unmark_all(TempMarkList* l) {
 // 이 기능은 관련 프로토타입 선언 이후에 함수 본문이 정의됩니다.
 
 // 에이전트의 모든 상태와 속성을 관리하는 구조체
-typedef struct {
+typedef struct Agent_ {
     int id;                     // 에이전트 고유 ID
     char symbol;                // 화면에 표시될 문자 (A, B, ...)
     Node* pos;                  // 현재 위치
@@ -754,6 +761,8 @@ static Planner planner_from_pathalgo(PathAlgo algo);
 static RendererFacade renderer_create_facade(void);
 // One-step execution helper (encapsulate one simulation tick)
 static void simulation_execute_one_step(Simulation* sim, int is_paused);
+// Cleanup helper
+static void force_idle_cleanup(AgentManager* am, Simulation* sim, Logger* lg);
 // Agent/AgentManager OO-like wrappers
 void agent_begin_task_park(Agent* ag, ScenarioManager* sc, Logger* lg);
 void agent_begin_task_exit(Agent* ag, ScenarioManager* sc, Logger* lg);
@@ -792,7 +801,7 @@ void logger_destroy(Logger*);
 GridMap* grid_map_create(AgentManager*);
 void grid_map_destroy(GridMap*);
 int grid_is_valid_coord(int x, int y);
-int grid_is_node_blocked(const GridMap*, const AgentManager*, const Node*);
+int grid_is_node_blocked(const GridMap*, const AgentManager*, const Node*, const struct Agent_*);
 
 // Scenario
 ScenarioManager* scenario_manager_create();
@@ -810,7 +819,7 @@ void agent_manager_plan_and_resolve_collisions_astar(AgentManager*, GridMap*, Lo
 void agent_manager_plan_and_resolve_collisions_dstar_basic(AgentManager*, GridMap*, Logger*, Node* next_pos[MAX_AGENTS]);
 
 // Pathfinder (Incremental D* Lite)
-Pathfinder* pathfinder_create(Node* start, Node* goal);
+Pathfinder* pathfinder_create(Node* start, Node* goal, const struct Agent_* agent);
 void pathfinder_destroy(Pathfinder* pf);
 void pathfinder_reset_goal(Pathfinder* pf, Node* new_goal);
 void pathfinder_update_start(Pathfinder* pf, Node* new_start);
@@ -844,7 +853,7 @@ typedef struct PathfinderFactory_ {
     Pathfinder* (*create)(Node* start, Node* goal);
     void (*destroy)(Pathfinder* pf);
 } PathfinderFactory;
-static inline Pathfinder* pf_factory_create(Node* start, Node* goal) { return pathfinder_create(start, goal); }
+static inline Pathfinder* pf_factory_create(Node* start, Node* goal) { return pathfinder_create(start, goal, NULL); }
 static inline void pf_factory_destroy(Pathfinder* pf) { pathfinder_destroy(pf); }
 static PathfinderFactory g_pf_factory = { pf_factory_create, pf_factory_destroy };
 
@@ -1847,10 +1856,10 @@ void grid_map_load_scenario(GridMap* map, AgentManager* am, int scenario_id) {
     case 1: {
         static const char* MAP1 =
             "1111111111111111111111111111111111111\n"
-            "C01GGG1GG1GGG1GGG1GGG1GGG1GGG1G11G111\n"
+            "D01GGG1GG1GGG1GGG1GGG1GGG1GGG1G11G111\n"
             "A000000000000000000000000000000000001\n"
             "B000000000000000000000000000000000001\n"
-            "0001GG1GG1GGG10001GGG1GGG1GGG1100e111\n"
+            "C001GG1GG1GGG10001GGG1GGG1GGG1100e111\n"
             "111111111111110001GGG1GGG1GGG11001111\n"
             "100000000000000000000000000000000e111\n"
             "100000000000000000000000000000000e111\n"
@@ -1862,7 +1871,7 @@ void grid_map_load_scenario(GridMap* map, AgentManager* am, int scenario_id) {
         break;
     }
     case 2: map_build_hypermart(map, am);              break; // 대형마트 주차장
-    case 3: map_build_10agents_200slots(map, am);      break; // 10대 + 900칸 + 10x4
+    case 3: map_build_10agents_200slots(map, am);      break; // 8대 + 900칸 + 16x6
     case 4: map_build_biggrid_onegoal(map, am);        break; // 격자도로 + 주차블록 4개
     case 5: map_build_cross_4agents(map, am);          break; // 십자가맵
     default:
@@ -2015,7 +2024,7 @@ static void map_build_hypermart(GridMap* m, AgentManager* am) {
 
 
 
-// #3: 10 agents + 900 parking slots
+// #3: 8 agents + 900 parking slots
 // - 좌측 2차선 세로도로(x=2,3) + y=6,7 가로 2차선 피더 유지
 // - 스타트 영역을 10x4 → 16x6으로 '살짝' 확장
 // - 확장된 스타트 영역 내부에 충전소 4개(2x2) 배치
@@ -2039,8 +2048,8 @@ static void map_build_10agents_200slots(GridMap* m, AgentManager* am) {
     const int sW = 16, sH = 6;                 // ★ 확장
     map_reserve_area_as_start(m, sx0, sy0, sW, sH);
 
-    /* A..J 배치(기존 그대로) */
-    for (int i = 0; i < 10; ++i) {
+    /* A..H 배치(8대) */
+    for (int i = 0; i < 8; ++i) {
         int row = i / 5, col = i % 5;
         map_place_agent_at(am, m, i, sx0 + col * 2, sy0 + row * 2);
     }
@@ -2360,8 +2369,14 @@ void grid_map_destroy(GridMap* m) { if (m) free(m); }
 
 int grid_is_valid_coord(int x, int y) { return (x >= 0 && x < GRID_WIDTH && y >= 0 && y < GRID_HEIGHT); }
 
-int grid_is_node_blocked(const GridMap* map, const AgentManager* am, const Node* n) {
+int grid_is_node_blocked(const GridMap* map, const AgentManager* am, const Node* n, const struct Agent_* agent) {
     if (n->is_obstacle || n->is_parked || n->is_temp) return TRUE;
+
+    // 기지 복귀 차량(RETURNING_HOME_EMPTY)은 빈 주차 공간을 이용할 수 없음
+    if (agent && agent->state == RETURNING_HOME_EMPTY && n->is_goal && !n->is_parked) {
+        return TRUE;
+    }
+
     for (int i = 0; i < MAX_AGENTS; i++) {
         if (am->agents[i].pos == n && am->agents[i].state == CHARGING) return TRUE;
     }
@@ -2642,7 +2657,7 @@ static void updateVertex(Pathfinder* pf, GridMap* map, const AgentManager* am, N
             int nx = u->x + DIR4_X[i], ny = u->y + DIR4_Y[i];
             if (!grid_is_valid_coord(nx, ny)) continue;
             Node* s = &map->grid[ny][nx];
-            if (!grid_is_node_blocked(map, am, s)) {
+            if (!grid_is_node_blocked(map, am, s, pf->agent)) {
                 double gsucc = cell_of(pf, s)->g;
                 double cand = 1.0 + gsucc;
                 if (cand < min_rhs) min_rhs = cand;
@@ -2662,10 +2677,11 @@ static void updateVertex(Pathfinder* pf, GridMap* map, const AgentManager* am, N
  * @param goal 목표 노드
  * @return 생성된 Pathfinder 포인터
  */
-Pathfinder* pathfinder_create(Node* start, Node* goal) {
+Pathfinder* pathfinder_create(Node* start, Node* goal, const Agent* agent) {
     Pathfinder* pf = (Pathfinder*)calloc(1, sizeof(Pathfinder)); if (!pf) return NULL;
     pq_init(&pf->pq, GRID_WIDTH * GRID_HEIGHT);
     pf->start_node = start; pf->last_start = start; pf->goal_node = goal; pf->km = 0.0;
+    pf->agent = agent;
 
     for (int y = 0; y < GRID_HEIGHT; y++)
         for (int x = 0; x < GRID_WIDTH; x++) {
@@ -2798,7 +2814,7 @@ Node* pathfinder_get_next_step(Pathfinder* pf, const GridMap* map, const AgentMa
         int nx = current->x + DIR4_X[i], ny = current->y + DIR4_Y[i];
         if (!grid_is_valid_coord(nx, ny)) continue;
         Node* nb = &((GridMap*)map)->grid[ny][nx];
-        if (grid_is_node_blocked(map, am, nb)) continue;
+        if (grid_is_node_blocked(map, am, nb, pf->agent)) continue;
         double gsucc = cell_of(pf, nb)->g;
         double cost = 1.0 + gsucc;
         if (cost < best) {
@@ -2954,7 +2970,7 @@ static double calculate_path_cost_tempPF(Agent* ag, Node* goal, GridMap* map, Ag
     // 하드 블록(벽) 목표는 바로 배제
     if (goal->is_obstacle) return INF;
 
-    Pathfinder* pf = pathfinder_create(ag->pos, goal);
+    Pathfinder* pf = pathfinder_create(ag->pos, goal, ag);
     if (!pf) return INF;
 
     pathfinder_compute_shortest_path(pf, map, am);
@@ -3076,7 +3092,7 @@ static void ensure_pathfinder_for_agent(Agent* ag) {
      */
     if (!ag->goal) return;
     if (ag->pf == NULL) {
-        ag->pf = pathfinder_create(ag->pos, ag->goal);
+        ag->pf = pathfinder_create(ag->pos, ag->goal, ag);
     }
     else if (ag->pf->goal_node != ag->goal) {
         ag->pf->start_node = ag->pos;
@@ -3211,7 +3227,7 @@ static int best_candidate_order(Pathfinder* pf, const GridMap* map, const AgentM
         int nx = cur->x + DIR4_X[k], ny = cur->y + DIR4_Y[k];
         if (!grid_is_valid_coord(nx, ny)) continue;
         Node* nb = &((GridMap*)map)->grid[ny][nx];
-        if (grid_is_node_blocked(map, am, nb)) continue;
+        if (grid_is_node_blocked(map, am, nb, pf->agent)) continue;
         double gsucc = cell_of(pf, nb)->g;
         double cost = 1.0 + gsucc;
         double d = manhattan_nodes(nb, goal);
@@ -4208,7 +4224,7 @@ void agent_manager_plan_and_resolve_collisions_dstar_basic(AgentManager* m, Grid
         Node* desired_move = current_pos;
         {
             if (!ag->pf) {
-                ag->pf = pathfinder_create(ag->pos, ag->goal);
+                ag->pf = pathfinder_create(ag->pos, ag->goal, ag);
             }
             else if (ag->pf->goal_node != ag->goal) {
                 ag->pf->start_node = ag->pos;
@@ -4417,7 +4433,7 @@ static int simulation_setup_map(Simulation* sim) {
     printf(C_B_WHT "--- 맵 선택 (1~5) ---\n" C_NRM);
     printf("1. %s기본 주차장%s (기존)\n", C_B_GRN, C_NRM);
     printf("2. %s대형마트형 1차선 격자%s\n", C_B_YEL, C_NRM);
-    printf("3. %s10 AGV + 900칸%s (스타트 16×6, A~J)\n", C_B_YEL, C_NRM);
+    printf("3. %s8 AGV + 900칸%s (스타트 16×6, A~H)\n", C_B_YEL, C_NRM);
     printf("4. %s격자도로(1차선) + 주차블록 4개%s (스타트 10×4, A~J)\n", C_B_YEL, C_NRM);
     printf("5. %s십자가 맵%s (중앙 충전소, 끝점 에이전트, +4칸에 주차)\n\n", C_B_YEL, C_NRM);
     int mid = get_integer_input("맵 번호를 선택하세요 (1~5): ", 1, 5);
@@ -4613,6 +4629,59 @@ static void simulation_execute_one_step(Simulation* sim, int is_paused) {
     // 계획 단계 캡슐화
     simulation_plan_step(sim, next_pos);
 
+    // 회전 대기(TURN_90_WAIT) 적용: 모든 알고리즘 공통 처리
+    {
+        AgentManager* am = sim->agent_manager;
+        for (int i = 0; i < MAX_AGENTS; i++) {
+            Agent* ag = &am->agents[i];
+            if (ag->state == CHARGING) continue;
+            Node* current = ag->pos;
+            if (!current || !next_pos[i]) continue;
+            if (ag->rotation_wait > 0) {
+                next_pos[i] = current;
+                ag->rotation_wait--;
+                continue;
+            }
+            Node* adjusted = current;
+            agent_apply_rotation_and_step(ag, current, next_pos[i], &adjusted);
+            next_pos[i] = adjusted;
+        }
+
+        // 회전 대기 중인 에이전트 칸 진입 금지(통과 방지)
+        for (int i = 0; i < MAX_AGENTS; i++) {
+            Agent* blocker = &am->agents[i];
+            if (!blocker->pos) continue;
+            if (blocker->rotation_wait <= 0) continue;
+            Node* blocked_cell = blocker->pos;
+            for (int j = 0; j < MAX_AGENTS; j++) {
+                if (j == i) continue;
+                Agent* mover = &am->agents[j];
+                if (!mover->pos || !next_pos[j]) continue;
+                if (next_pos[j] == blocked_cell && mover->pos != blocked_cell) {
+                    next_pos[j] = mover->pos; // 대기 처리
+                }
+            }
+        }
+
+        // 추가 안전장치: 이번 틱에 "정지"하는 에이전트의 현재 칸으로 진입 금지
+        // (회전 대기 외에도 작업 대기 등으로 정지하는 경우 포함)
+        for (int i = 0; i < MAX_AGENTS; i++) {
+            Agent* stopper = &am->agents[i];
+            if (!stopper->pos) continue;
+            if (!next_pos[i]) continue;
+            if (next_pos[i] != stopper->pos) continue; // 움직이는 에이전트는 제외
+            Node* blocked_cell = stopper->pos;
+            for (int j = 0; j < MAX_AGENTS; j++) {
+                if (j == i) continue;
+                Agent* mover = &am->agents[j];
+                if (!mover->pos || !next_pos[j]) continue;
+                if (next_pos[j] == blocked_cell && mover->pos != blocked_cell) {
+                    next_pos[j] = mover->pos; // 대기 처리
+                }
+            }
+        }
+    }
+
     int moved_this_step = apply_moves_and_update_stuck(sim, next_pos, prev_pos);
 
     unsigned long long prev_completed_tasks = sim->tasks_completed_total;
@@ -4647,6 +4716,10 @@ static void simulation_execute_one_step(Simulation* sim, int is_paused) {
             sim->post_phase_last_step = step_label;
             sim->post_phase_step_count++;
             sim->post_phase_cpu_time_ms += step_time_ms;
+            // 모든 단계가 끝난 뒤 일정 스텝이 지나도 잔여 에이전트가 남아있으면 강제 유휴화로 교착 해소
+            if (sim->post_phase_step_count >= CLEANUP_FORCE_IDLE_AFTER_STEPS) {
+                force_idle_cleanup(sim->agent_manager, sim, sim->logger);
+            }
         }
     }
 
@@ -4662,6 +4735,27 @@ static void simulation_execute_one_step(Simulation* sim, int is_paused) {
 
     // 프레임 갱신 (프레임 스킵은 renderer 내부에서 처리됨)
     sim->renderer.vtbl.draw_frame(sim, is_paused);
+}
+
+// 모든 에이전트를 강제로 IDLE 상태로 전환하여 정리 단계에서의 교착을 해소한다
+static void force_idle_cleanup(AgentManager* am, Simulation* sim, Logger* lg) {
+    if (!am) return;
+    int changed = 0;
+    for (int i = 0; i < MAX_AGENTS; i++) {
+        Agent* ag = &am->agents[i];
+        if (!ag->pos) continue;
+        if (ag->state == IDLE) continue;
+        if (ag->goal) { ag->goal->reserved_by_agent = -1; ag->goal = NULL; }
+        if (ag->pf) { pathfinder_destroy(ag->pf); ag->pf = NULL; }
+        ag->rotation_wait = 0;
+        ag->stuck_steps = 0;
+        ag->action_timer = 0;
+        ag->state = IDLE;
+        changed = 1;
+    }
+    if (changed && lg) {
+        logger_log(lg, "[%sCleanup%s] 모든 에이전트를 강제 IDLE로 전환하여 교착을 해소했습니다.", C_B_CYN, C_NRM);
+    }
 }
 /**
  * @brief 시뮬레이션 종료 조건(커스텀: 모든 단계 완료, 실시간: 시간 제한)을 확인합니다.
@@ -4861,6 +4955,8 @@ int main() {
         simulation_run(sim);       // 프레임 갱신해도 스크롤백 오염 없음
         ui_leave_alt_screen();     // ALT 스크린 종료(원래 화면 복귀)
         simulation_print_performance_summary(sim);
+        printf("\n결과를 확인하려면 아무 키나 누르세요...\n");
+        (void)_getch();
     }
     else {
         printf("\n시뮬레이션이 취소되었습니다. 종료합니다.\n");
