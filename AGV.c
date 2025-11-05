@@ -316,6 +316,11 @@ typedef struct Pathfinder_ {
     Node* last_start;                           // 이전 스텝의 시작 위치 (km 계산용)
     double km;                                  // D* Lite의 키 수정자 (key modifier)
     const struct Agent_* agent;                 // 이 Pathfinder를 소유한 에이전트 (블록 체크용)
+    // --- 알고리즘 메트릭 (스텝별 집계용) ---
+    unsigned long long nodes_expanded_this_call; // 이번 호출에서 확장된 노드 수
+    unsigned long long heap_moves_this_call;     // 이번 호출에서 발생한 힙 이동 수
+    unsigned long long nodes_generated_this_call;  // nodes pushed into OPEN during this call
+    unsigned long long valid_expansions_this_call; // relaxations committed during this call
 } Pathfinder;
 
 // --- WHCA* 시간 확장 예약 테이블 ---
@@ -600,6 +605,17 @@ typedef struct Simulation_ {
     // --- 실시간 모드 요청 메트릭 ---
     unsigned long long requests_created_total; // 총 생성된 요청 수
     unsigned long long request_wait_ticks_sum; // 모든 요청의 총 대기 시간(틱) 합계
+    // --- 알고리즘 연산 메트릭 (노드 확장 수, 힙 이동 수) ---
+    unsigned long long algo_nodes_expanded_total;     // 총 노드 확장 수
+    unsigned long long algo_heap_moves_total;         // 총 힙 이동 수
+    unsigned long long algo_nodes_expanded_last_step;  // 마지막 스텝의 노드 확장 수
+    unsigned long long algo_heap_moves_last_step;      // 마지막 스텝의 힙 이동 수
+    unsigned long long algo_linear_scans_total;         // linear search operations tally
+    unsigned long long algo_generated_nodes_total;      // candidate nodes accepted this run
+    unsigned long long algo_valid_expansions_total;     // successful relaxations this run
+    unsigned long long algo_linear_scans_last_step;     // linear search ops in last step
+    unsigned long long algo_generated_nodes_last_step;  // generated nodes in last step
+    unsigned long long algo_valid_expansions_last_step; // valid relaxations in last step
 } Simulation;
 
 // MetricsSnapshot 구조체 전방 선언 (옵저버 시그니처용)
@@ -635,6 +651,28 @@ static struct {
     int cbs_exp_last;
     long long cbs_success_sum;
     long long cbs_fail_sum;
+    // --- WHCA* 노드 확장 수 (스텝별 임시 저장용) ---
+    unsigned long long whca_nodes_expanded_this_step;
+    // --- A* 알고리즘 메트릭 (스텝별 임시 저장용) ---
+    unsigned long long astar_nodes_expanded_this_step;
+    unsigned long long astar_heap_moves_this_step;
+    // --- WHCA* 알고리즘 메트릭 (스텝별 임시 저장용 - D* Lite 부분) ---
+    unsigned long long whca_dstar_nodes_expanded_this_step;
+    unsigned long long whca_dstar_heap_moves_this_step;
+    // --- D* Lite 알고리즘 메트릭 (스텝별 임시 저장용) ---
+    unsigned long long dstar_nodes_expanded_this_step;
+    unsigned long long dstar_heap_moves_this_step;
+    unsigned long long whca_linear_scans_this_step;
+    unsigned long long whca_generated_nodes_this_step;
+    unsigned long long whca_valid_expansions_this_step;
+    unsigned long long whca_dstar_generated_nodes_this_step;
+    unsigned long long whca_dstar_valid_expansions_this_step;
+    unsigned long long astar_linear_scans_this_step;
+    unsigned long long astar_generated_nodes_this_step;
+    unsigned long long astar_valid_expansions_this_step;
+    unsigned long long dstar_linear_scans_this_step;
+    unsigned long long dstar_generated_nodes_this_step;
+    unsigned long long dstar_valid_expansions_this_step;
 } g_metrics = { 0 };
 
 // --- GlobalConfig (non-invasive; mirrors existing globals by pointer) ---
@@ -1078,6 +1116,12 @@ static void simulation_reset_runtime_stats(Simulation* sim) {
     sim->metrics_sum_ttask = 0.0;
     sim->requests_created_total = 0;
     sim->request_wait_ticks_sum = 0;
+    sim->algo_linear_scans_total = 0;
+    sim->algo_generated_nodes_total = 0;
+    sim->algo_valid_expansions_total = 0;
+    sim->algo_linear_scans_last_step = 0;
+    sim->algo_generated_nodes_last_step = 0;
+    sim->algo_valid_expansions_last_step = 0;
 }
 
 /**
@@ -1120,6 +1164,12 @@ static void simulation_report_realtime_dashboard(Simulation* sim) {
     printf(" Request Wait Ticks (sum)       : %llu\n", sim->request_wait_ticks_sum);
     printf(" Process Memory Usage Sum      : %.2f KB (avg %.2f KB / sample, peak %.2f KB)\n",
         sim->memory_usage_sum_kb, avg_memory_kb, sim->memory_usage_peak_kb);
+    printf(" Linear Scan Ops (total/last)     : %llu / %llu\n", sim->algo_linear_scans_total, sim->algo_linear_scans_last_step);
+    printf(" Generated Nodes (total/last)     : %llu / %llu\n", sim->algo_generated_nodes_total, sim->algo_generated_nodes_last_step);
+    printf(" Valid Expansions (total/last)    : %llu / %llu\n", sim->algo_valid_expansions_total, sim->algo_valid_expansions_last_step);
+    double dash_ratio_total = (sim->algo_generated_nodes_total > 0) ? (double)sim->algo_valid_expansions_total / (double)sim->algo_generated_nodes_total : 0.0;
+    double dash_ratio_last = (sim->algo_generated_nodes_last_step > 0) ? (double)sim->algo_valid_expansions_last_step / (double)sim->algo_generated_nodes_last_step : 0.0;
+    printf(" Valid Expansion Ratio (total/last): %.4f / %.4f\n", dash_ratio_total, dash_ratio_last);
     printf("===================================================\n");
 
     sim->last_report_completed_tasks = total_completed;
@@ -1311,6 +1361,45 @@ static void ui_handle_control_key(Simulation* sim, int ch, int* is_paused, int* 
  */
 static void simulation_plan_step(Simulation* sim, Node* next_pos[MAX_AGENTS]) {
     clock_t plan_start_cpu = clock();
+
+    // 메트릭 초기화 (스텝 시작 시 모든 Pathfinder 메트릭도 초기화)
+    sim->algo_nodes_expanded_last_step = 0;
+    sim->algo_heap_moves_last_step = 0;
+    sim->algo_linear_scans_last_step = 0;
+    sim->algo_generated_nodes_last_step = 0;
+    sim->algo_valid_expansions_last_step = 0;
+    g_metrics.whca_nodes_expanded_this_step = 0;  // WHCA* (Partial CBS) 노드 확장 수 초기화
+    g_metrics.whca_dstar_nodes_expanded_this_step = 0;  // WHCA* (D* Lite 부분) 노드 확장 수 초기화
+    g_metrics.whca_dstar_heap_moves_this_step = 0;      // WHCA* (D* Lite 부분) 힙 이동 수 초기화
+    g_metrics.astar_nodes_expanded_this_step = 0;  // A* 노드 확장 수 초기화
+    g_metrics.astar_heap_moves_this_step = 0;      // A* 힙 이동 수 초기화
+    g_metrics.dstar_nodes_expanded_this_step = 0;  // D* Lite 노드 확장 수 초기화
+    g_metrics.dstar_heap_moves_this_step = 0;      // D* Lite 힙 이동 수 초기화
+    g_metrics.whca_linear_scans_this_step = 0;
+    g_metrics.whca_generated_nodes_this_step = 0;
+    g_metrics.whca_valid_expansions_this_step = 0;
+    g_metrics.whca_dstar_generated_nodes_this_step = 0;
+    g_metrics.whca_dstar_valid_expansions_this_step = 0;
+    g_metrics.astar_linear_scans_this_step = 0;
+    g_metrics.astar_generated_nodes_this_step = 0;
+    g_metrics.astar_valid_expansions_this_step = 0;
+    g_metrics.dstar_linear_scans_this_step = 0;
+    g_metrics.dstar_generated_nodes_this_step = 0;
+    g_metrics.dstar_valid_expansions_this_step = 0;
+
+    // 각 에이전트의 Pathfinder 메트릭도 초기화 (이전 스텝 값이 남아있을 수 있음)
+    if (sim->agent_manager) {
+        for (int i = 0; i < MAX_AGENTS; i++) {
+            Agent* ag = &sim->agent_manager->agents[i];
+            if (ag->pf) {
+                ag->pf->nodes_expanded_this_call = 0;
+                ag->pf->heap_moves_this_call = 0;
+                ag->pf->nodes_generated_this_call = 0;
+                ag->pf->valid_expansions_this_call = 0;
+            }
+        }
+    }
+
     if (sim->planner.vtbl.plan_step) {
         sim->planner.vtbl.plan_step(sim->agent_manager, sim->map, sim->logger, next_pos);
     }
@@ -1328,6 +1417,51 @@ static void simulation_plan_step(Simulation* sim, Node* next_pos[MAX_AGENTS]) {
             break;
         }
     }
+
+    // 알고리즘 메트릭 수집 (모든 알고리즘이 전역 변수에서 수집하도록 통일)
+    unsigned long long step_nodes = 0;
+    unsigned long long step_heap_moves = 0;
+    unsigned long long step_linear_scans = 0;
+    unsigned long long step_generated_nodes = 0;
+    unsigned long long step_valid_expansions = 0;
+
+    if (sim->path_algo == PATHALGO_ASTAR_SIMPLE) {
+        // 2�� �˰����� (A*)
+        step_nodes = g_metrics.astar_nodes_expanded_this_step;
+        step_heap_moves = g_metrics.astar_heap_moves_this_step;
+        step_linear_scans = g_metrics.astar_linear_scans_this_step;
+        step_generated_nodes = g_metrics.astar_generated_nodes_this_step;
+        step_valid_expansions = g_metrics.astar_valid_expansions_this_step;
+    }
+    else if (sim->path_algo == PATHALGO_DSTAR_BASIC) {
+        // 3�� �˰����� (D* Lite)
+        step_nodes = g_metrics.dstar_nodes_expanded_this_step;
+        step_heap_moves = g_metrics.dstar_heap_moves_this_step;
+        step_linear_scans = g_metrics.dstar_linear_scans_this_step;
+        step_generated_nodes = g_metrics.dstar_generated_nodes_this_step;
+        step_valid_expansions = g_metrics.dstar_valid_expansions_this_step;
+    }
+    else {
+        // 1�� �˰����� (WHCA*)
+        // WHCA*�� D* Lite �κ� + Partial CBS (WHCA*) �κ�
+        step_nodes = g_metrics.whca_dstar_nodes_expanded_this_step + g_metrics.whca_nodes_expanded_this_step;
+        step_heap_moves = g_metrics.whca_dstar_heap_moves_this_step;
+        step_linear_scans = g_metrics.whca_linear_scans_this_step;
+        step_generated_nodes = g_metrics.whca_dstar_generated_nodes_this_step + g_metrics.whca_generated_nodes_this_step;
+        step_valid_expansions = g_metrics.whca_dstar_valid_expansions_this_step + g_metrics.whca_valid_expansions_this_step;
+    }
+
+    sim->algo_nodes_expanded_last_step = step_nodes;
+    sim->algo_heap_moves_last_step = step_heap_moves;
+    sim->algo_linear_scans_last_step = step_linear_scans;
+    sim->algo_generated_nodes_last_step = step_generated_nodes;
+    sim->algo_valid_expansions_last_step = step_valid_expansions;
+    sim->algo_nodes_expanded_total += step_nodes;
+    sim->algo_heap_moves_total += step_heap_moves;
+    sim->algo_linear_scans_total += step_linear_scans;
+    sim->algo_generated_nodes_total += step_generated_nodes;
+    sim->algo_valid_expansions_total += step_valid_expansions;
+
     clock_t plan_end_cpu = clock();
     double planning_time_ms = ((double)(plan_end_cpu - plan_start_cpu) * 1000.0) / CLOCKS_PER_SEC;
     sim->last_planning_time_ms = planning_time_ms;
@@ -1856,10 +1990,10 @@ void grid_map_load_scenario(GridMap* map, AgentManager* am, int scenario_id) {
     case 1: {
         static const char* MAP1 =
             "1111111111111111111111111111111111111\n"
-            "D01GGG1GG1GGG1GGG1GGG1GGG1GGG1G11G111\n"
+            "C01GGG1GG1GGG1GGG1GGG1GGG1GGG1G11G111\n"
             "A000000000000000000000000000000000001\n"
             "B000000000000000000000000000000000001\n"
-            "C001GG1GG1GGG10001GGG1GGG1GGG1100e111\n"
+            "0001GG1GG1GGG10001GGG1GGG1GGG1100e111\n"
             "111111111111110001GGG1GGG1GGG11001111\n"
             "100000000000000000000000000000000e111\n"
             "100000000000000000000000000000000e111\n"
@@ -2015,15 +2149,6 @@ static void map_build_hypermart(GridMap* m, AgentManager* am) {
 }
 
 
-
-
-
-
-
-// (Map #3 제거됨)
-
-
-
 // #3: 8 agents + 900 parking slots
 // - 좌측 2차선 세로도로(x=2,3) + y=6,7 가로 2차선 피더 유지
 // - 스타트 영역을 10x4 → 16x6으로 '살짝' 확장
@@ -2165,11 +2290,6 @@ static void map_build_10agents_200slots(GridMap* m, AgentManager* am) {
         m->grid[y][3].is_goal = FALSE;
     }
 }
-
-
-
-
-
 
 // ──────────────────────────────────────────────────────────────
 // 1-차선 주차블록 + 1-칸 링도로 + 격자도로로의 연결(가까운 격자선에 스냅)
@@ -2313,16 +2433,6 @@ static void map_build_biggrid_onegoal(GridMap* m, AgentManager* am) {
             if (m->grid[y][x].is_goal && m->num_goals < MAX_GOALS)
                 m->goals[m->num_goals++] = &m->grid[y][x];
 }
-
-
-
-
-
-
-
-
-
-
 
 // #5: 십자가 맵 (Cross) - 중앙 충전소, 각 팔 끝에 에이전트, 각 에이전트에서 4칸 진행 지점에 주차칸
 static void map_build_cross_4agents(GridMap* m, AgentManager* am) {
@@ -2537,6 +2647,7 @@ static void heapify_up(Pathfinder* pf, NodePQ* pq, int i) {
     int p = (i - 1) / 2;
     if (compare_keys(key_of(pf, pq->nodes[i]), key_of(pf, pq->nodes[p])) < 0) {
         pq_swap(pf, &pq->nodes[i], &pq->nodes[p]);
+        if (pf) pf->heap_moves_this_call++;  // 힙 이동 수 카운트
         heapify_up(pf, pq, p);
     }
 }
@@ -2550,7 +2661,11 @@ static void heapify_down(Pathfinder* pf, NodePQ* pq, int i) {
     int l = 2 * i + 1, r = 2 * i + 2, s = i;
     if (l < pq->size && compare_keys(key_of(pf, pq->nodes[l]), key_of(pf, pq->nodes[s])) < 0) s = l;
     if (r < pq->size && compare_keys(key_of(pf, pq->nodes[r]), key_of(pf, pq->nodes[s])) < 0) s = r;
-    if (s != i) { pq_swap(pf, &pq->nodes[i], &pq->nodes[s]); heapify_down(pf, pq, s); }
+    if (s != i) {
+        pq_swap(pf, &pq->nodes[i], &pq->nodes[s]);
+        if (pf) pf->heap_moves_this_call++;  // 힙 이동 수 카운트
+        heapify_down(pf, pq, s);
+    }
 }
 /**
  * @brief 특정 노드가 큐에 포함되어 있는지 확인합니다.
@@ -2577,6 +2692,7 @@ static Key pq_top_key(Pathfinder* pf, const NodePQ* pq) {
  */
 static void pq_push(Pathfinder* pf, NodePQ* pq, Node* n) {
     if (pq->size >= pq->capacity) return;
+    if (pf) pf->nodes_generated_this_call++;
     SearchCell* c = cell_of(pf, n);
     c->in_pq = TRUE; c->pq_index = pq->size; pq->nodes[pq->size++] = n;
     heapify_up(pf, pq, pq->size - 1);
@@ -2682,6 +2798,10 @@ Pathfinder* pathfinder_create(Node* start, Node* goal, const Agent* agent) {
     pq_init(&pf->pq, GRID_WIDTH * GRID_HEIGHT);
     pf->start_node = start; pf->last_start = start; pf->goal_node = goal; pf->km = 0.0;
     pf->agent = agent;
+    pf->nodes_expanded_this_call = 0;
+    pf->heap_moves_this_call = 0;
+    pf->nodes_generated_this_call = 0;
+    pf->valid_expansions_this_call = 0;
 
     for (int y = 0; y < GRID_HEIGHT; y++)
         for (int x = 0; x < GRID_WIDTH; x++) {
@@ -2758,6 +2878,10 @@ void pathfinder_notify_cell_change(Pathfinder* pf, GridMap* map, const AgentMana
 void pathfinder_compute_shortest_path(Pathfinder* pf, GridMap* map, const AgentManager* am) {
     if (!pf->start_node || !pf->goal_node) return;
 
+    // 메트릭 초기화 (이전 값 유지하지 않고 새로 시작)
+    pf->nodes_expanded_this_call = 0;
+    pf->heap_moves_this_call = 0;
+
     while (TRUE) {
         Key top = pq_top_key(pf, &pf->pq);
         SearchCell* cs = cell_of(pf, pf->start_node);
@@ -2767,6 +2891,7 @@ void pathfinder_compute_shortest_path(Pathfinder* pf, GridMap* map, const AgentM
 
         Key k_old = top;
         Node* u = pq_pop(pf, &pf->pq);
+        if (u) pf->nodes_expanded_this_call++;  // 노드 확장 수 카운트
         SearchCell* cu = cell_of(pf, u);
         Key k_new = calculate_key(pf, u);
 
@@ -2776,6 +2901,7 @@ void pathfinder_compute_shortest_path(Pathfinder* pf, GridMap* map, const AgentM
         }
         else if (cu->g > cu->rhs) {
             cu->g = cu->rhs;
+            pf->valid_expansions_this_call++;
             for (int i = 0; i < DIR4_COUNT; i++) {
                 int px = u->x + DIR4_X[i], py = u->y + DIR4_Y[i];
                 if (grid_is_valid_coord(px, py))
@@ -3360,7 +3486,12 @@ static int violates_constraint_for(int agent, int t_prev, int x_prev, int y_prev
 static int st_astar_plan_single(int agent_id, GridMap* map, Node* start, Node* goal, int horizon,
     int ext_occ[MAX_WHCA_HORIZON + 1][GRID_HEIGHT][GRID_WIDTH],
     const CBSConstraint* cons, int ncons,
-    Node* out_plan[MAX_WHCA_HORIZON + 1]) {
+    Node* out_plan[MAX_WHCA_HORIZON + 1],
+    AgentDir initial_heading,
+    unsigned long long* out_nodes_expanded,
+    unsigned long long* out_linear_scans,
+    unsigned long long* out_generated_nodes,
+    unsigned long long* out_valid_expansions) {
     /**
      * @brief 시간-공간 A*로 단일 에이전트의 호라이즌 내 계획을 수립합니다.
      *        정지 이동 포함(STAY), 외부 예약/제약을 고려합니다.
@@ -3379,6 +3510,10 @@ static int st_astar_plan_single(int agent_id, GridMap* map, Node* start, Node* g
     int T = horizon;
     int W = GRID_WIDTH, H = GRID_HEIGHT;
     int TOT = (T + 1) * W * H;
+    if (out_nodes_expanded) *out_nodes_expanded = 0;
+    if (out_linear_scans) *out_linear_scans = 0;
+    if (out_generated_nodes) *out_generated_nodes = 0;
+    if (out_valid_expansions) *out_valid_expansions = 0;
     if (TOT > MAX_TOT) return 0;
 
     double* g = G_buf;
@@ -3402,12 +3537,20 @@ static int st_astar_plan_single(int agent_id, GridMap* map, Node* start, Node* g
     open[start_idx] = 1;
 
     int best_idx = start_idx; double best_val = f[start_idx];
+    unsigned long long nodes_expanded = 0;
+    unsigned long long linear_scans = 0;
+    unsigned long long generated_nodes = 0;
+    unsigned long long valid_expansions = 0;
 
     while (1) {
         int cur = -1; double curF = INF;
-        for (int i = 0; i < TOT; i++) if (open[i] && f[i] < curF) { curF = f[i]; cur = i; }
+        for (int i = 0; i < TOT; i++) {
+            if (open[i] && f[i] < curF) { curF = f[i]; cur = i; }
+            linear_scans++;
+        }
         if (cur == -1) break;
         open[cur] = 0; closed[cur] = 1;
+        nodes_expanded++;
 
         int ct = cur / (W * H);
         int rem = cur % (W * H);
@@ -3436,14 +3579,26 @@ static int st_astar_plan_single(int agent_id, GridMap* map, Node* start, Node* g
 
             int nid = ST_INDEX(nt, ny, nx, W, H);
             if (closed[nid]) continue;
+            generated_nodes++;
             {
                 double ng = g[cur] + 1.0;
+                // 회전 딜레이 비용을 초기 이동(ct==0)에서 가중치로 반영
+                if (ct == 0 && !(nx == cx && ny == cy)) {
+                    AgentDir move_heading = dir_from_delta(nx - cx, ny - cy);
+                    if (initial_heading != DIR_NONE) {
+                        int tsteps = dir_turn_steps(initial_heading, move_heading);
+                        if (tsteps == 1) {
+                            ng += (double)TURN_90_WAIT; // 90도 회전 가중치
+                        }
+                    }
+                }
                 if (ng + 1e-9 < g[nid]) {
                     g[nid] = ng;
                     double h = goal ? manhattan_xy(nx, ny, gx, gy) : 0.0;
                     f[nid] = ng + h;
                     prev[nid] = cur;
                     open[nid] = 1;
+                    valid_expansions++;
                 }
             }
         }
@@ -3454,6 +3609,11 @@ static int st_astar_plan_single(int agent_id, GridMap* map, Node* start, Node* g
         int cur = best_idx;
         while (cur != -1 && plen < (MAX_WHCA_HORIZON + 1)) { path_idx[plen++] = cur; cur = prev[cur]; }
     }
+    if (out_nodes_expanded) *out_nodes_expanded = nodes_expanded;
+    if (out_linear_scans) *out_linear_scans = linear_scans;
+    if (out_generated_nodes) *out_generated_nodes = generated_nodes;
+    if (out_valid_expansions) *out_valid_expansions = valid_expansions;
+
     if (plen == 0) {
         for (int t = 0; t <= T; t++) out_plan[t] = start;
         return 1;
@@ -3610,11 +3770,19 @@ static int run_partial_CBS(AgentManager* m, GridMap* map, Logger* lg,
     for (int i = 0; i < group_n; i++) {
         int id = group_ids[i];
         Node* plan[MAX_WHCA_HORIZON + 1];
+        unsigned long long nodes_exp = 0;
+        unsigned long long linear_ops = 0;
+        unsigned long long generated_nodes = 0;
+        unsigned long long valid_expansions = 0;
         if (!st_astar_plan_single(id, map, m->agents[id].pos, m->agents[id].goal, g_whca_horizon, ext_occ,
-            root.cons, root.ncons, plan)) {
+            root.cons, root.ncons, plan, m->agents[id].heading, &nodes_exp, &linear_ops, &generated_nodes, &valid_expansions)) {
             g_metrics.cbs_ok_last = 0; g_metrics.cbs_exp_last = expansions; g_metrics.cbs_fail_sum++;
             return 0;
         }
+        g_metrics.whca_nodes_expanded_this_step += nodes_exp;  // ��� Ȯ�� �� ����
+        g_metrics.whca_linear_scans_this_step += linear_ops;
+        g_metrics.whca_generated_nodes_this_step += generated_nodes;
+        g_metrics.whca_valid_expansions_this_step += valid_expansions;
         for (int t = 0; t <= g_whca_horizon; t++) root.plans[id][t] = plan[t];
     }
     {
@@ -3662,10 +3830,18 @@ static int run_partial_CBS(AgentManager* m, GridMap* map, Logger* lg,
                 for (int i = 0; i < group_n; i++) {
                     int id = group_ids[i];
                     Node* plan[MAX_WHCA_HORIZON + 1];
+                    unsigned long long nodes_exp = 0;
+                    unsigned long long linear_ops = 0;
+                    unsigned long long generated_nodes = 0;
+                    unsigned long long valid_expansions = 0;
                     if (!st_astar_plan_single(id, map, m->agents[id].pos, m->agents[id].goal, g_whca_horizon, ext_occ,
-                        child.cons, child.ncons, plan)) {
+                        child.cons, child.ncons, plan, m->agents[id].heading, &nodes_exp, &linear_ops, &generated_nodes, &valid_expansions)) {
                         ok = 0; break;
                     }
+                    g_metrics.whca_nodes_expanded_this_step += nodes_exp;  // ��� Ȯ�� �� ����
+                    g_metrics.whca_linear_scans_this_step += linear_ops;
+                    g_metrics.whca_generated_nodes_this_step += generated_nodes;
+                    g_metrics.whca_valid_expansions_this_step += valid_expansions;
                     for (int t = 0; t <= g_whca_horizon; t++) child.plans[id][t] = plan[t];
                 }
                 if (!ok) continue;
@@ -3724,7 +3900,15 @@ void agent_manager_plan_and_resolve_collisions(AgentManager* m, GridMap* map, Lo
             int goal_was_parked = (ag->state == GOING_TO_COLLECT && ag->goal->is_parked);
             if (goal_was_parked) ag->goal->is_parked = FALSE;
 
-            if (ag->pf) { pathfinder_update_start(ag->pf, ag->pos); pathfinder_compute_shortest_path(ag->pf, map, m); }
+            if (ag->pf) {
+                pathfinder_update_start(ag->pf, ag->pos);
+                pathfinder_compute_shortest_path(ag->pf, map, m);
+                // 메트릭 수집 (WHCA*의 D* Lite 부분을 전역 변수에 누적)
+                g_metrics.whca_dstar_nodes_expanded_this_step += ag->pf->nodes_expanded_this_call;
+                g_metrics.whca_dstar_heap_moves_this_step += ag->pf->heap_moves_this_call;
+                g_metrics.whca_dstar_generated_nodes_this_step += ag->pf->nodes_generated_this_call;
+                g_metrics.whca_dstar_valid_expansions_this_step += ag->pf->valid_expansions_this_call;
+            }
 
             Node* plan[MAX_WHCA_HORIZON + 1]; plan[0] = ag->pos;
             Node* cur = ag->pos;
@@ -4168,6 +4352,13 @@ void agent_manager_plan_and_resolve_collisions_astar(AgentManager* manager, Grid
 
             Pathfinder* pf = g_pf_factory.create(agent->pos, agent->goal);
             pathfinder_compute_shortest_path(pf, map, manager);
+
+            // 메트릭 수집 (pf가 destroy되기 전에 직접 전역 변수에 누적)
+            g_metrics.astar_nodes_expanded_this_step += pf->nodes_expanded_this_call;
+            g_metrics.astar_heap_moves_this_step += pf->heap_moves_this_call;
+            g_metrics.astar_generated_nodes_this_step += pf->nodes_generated_this_call;
+            g_metrics.astar_valid_expansions_this_step += pf->valid_expansions_this_call;
+
             desired_move = pathfinder_get_next_step(pf, map, manager, agent->pos);
             g_pf_factory.destroy(pf);
 
@@ -4247,6 +4438,11 @@ void agent_manager_plan_and_resolve_collisions_dstar_basic(AgentManager* m, Grid
             if (ag->pf) {
                 pathfinder_update_start(ag->pf, ag->pos);
                 pathfinder_compute_shortest_path(ag->pf, map, m);
+                // 메트릭 수집 (D* Lite 알고리즘의 메트릭을 전역 변수에 누적)
+                g_metrics.dstar_nodes_expanded_this_step += ag->pf->nodes_expanded_this_call;
+                g_metrics.dstar_heap_moves_this_step += ag->pf->heap_moves_this_call;
+                g_metrics.dstar_generated_nodes_this_step += ag->pf->nodes_generated_this_call;
+                g_metrics.dstar_valid_expansions_this_step += ag->pf->valid_expansions_this_call;
                 desired_move = pathfinder_get_next_step(ag->pf, map, m, ag->pos);
             }
 
@@ -4682,6 +4878,13 @@ static void simulation_execute_one_step(Simulation* sim, int is_paused) {
         }
     }
 
+    // 회전 보정 및 차단 로직 적용 이후, 최종 쌍대 충돌 정리를 한 번 더 수행(전 알고리즘 공통)
+    {
+        int order[MAX_AGENTS];
+        sort_agents_by_priority(sim->agent_manager, order);
+        resolve_conflicts_by_order(sim->agent_manager, order, next_pos);
+    }
+
     int moved_this_step = apply_moves_and_update_stuck(sim, next_pos, prev_pos);
 
     unsigned long long prev_completed_tasks = sim->tasks_completed_total;
@@ -4844,6 +5047,12 @@ void simulation_print_performance_summary(const Simulation* sim) {
     printf("============================================\n");
     printf(" Mode                                : %s\n", mode_label);
     printf(" Map ID                              : %d\n", sim->map_id);
+    {
+        const char* algo = "Default (WHCA* + D* Lite + WFG + CBS)";
+        if (sim->path_algo == PATHALGO_ASTAR_SIMPLE) algo = "A* (단순)";
+        else if (sim->path_algo == PATHALGO_DSTAR_BASIC) algo = "D* Lite (기본)";
+        printf(" Path Planning Algorithm             : %s\n", algo);
+    }
     printf(" Total Physical Time Steps           : %d\n", recorded_steps);
     {
         int active_agents = 0;
@@ -4863,6 +5072,26 @@ void simulation_print_performance_summary(const Simulation* sim) {
     printf(" Process Memory Usage Average        : %.2f KB\n", avg_memory_kb);
     printf(" Process Memory Usage Peak           : %.2f KB\n", sim->memory_usage_peak_kb);
     printf(" Remaining Parked Vehicles           : %d\n", am ? am->total_cars_parked : 0);
+    printf("\n -- 알고리즘 연산 메트릭 --\n");
+    printf(" Nodes Expanded (total)             : %llu\n", sim->algo_nodes_expanded_total);
+    printf(" Heap Moves (total)                  : %llu\n", sim->algo_heap_moves_total);
+    printf(" Linear Scan Ops (total)            : %llu\n", sim->algo_linear_scans_total);
+    printf(" Generated Nodes (total)            : %llu\n", sim->algo_generated_nodes_total);
+    printf(" Valid Expansions (total)           : %llu\n", sim->algo_valid_expansions_total);
+    double valid_ratio_total = (sim->algo_generated_nodes_total > 0) ? (double)sim->algo_valid_expansions_total / (double)sim->algo_generated_nodes_total : 0.0;
+    printf(" Valid Expansion Ratio (valid/gen) : %.4f\n", valid_ratio_total);
+    if (recorded_steps > 0) {
+        const double avg_nodes_per_step = (double)sim->algo_nodes_expanded_total / (double)recorded_steps;
+        const double avg_heap_moves_per_step = (double)sim->algo_heap_moves_total / (double)recorded_steps;
+        const double avg_linear_per_step = (double)sim->algo_linear_scans_total / (double)recorded_steps;
+        const double avg_generated_per_step = (double)sim->algo_generated_nodes_total / (double)recorded_steps;
+        const double avg_valid_per_step = (double)sim->algo_valid_expansions_total / (double)recorded_steps;
+        printf(" Nodes Expanded (avg per step)      : %.2f\n", avg_nodes_per_step);
+        printf(" Heap Moves (avg per step)          : %.2f\n", avg_heap_moves_per_step);
+        printf(" Linear Scan Ops (avg per step)     : %.2f\n", avg_linear_per_step);
+        printf(" Generated Nodes (avg per step)     : %.2f\n", avg_generated_per_step);
+        printf(" Valid Expansions (avg per step)    : %.2f\n", avg_valid_per_step);
+    }
 
     if (sc && sc->mode == MODE_CUSTOM) {
         printf("\n -- Custom Scenario Breakdown --\n");
