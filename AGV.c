@@ -1990,10 +1990,10 @@ void grid_map_load_scenario(GridMap* map, AgentManager* am, int scenario_id) {
     case 1: {
         static const char* MAP1 =
             "1111111111111111111111111111111111111\n"
-            "C01GGG1GG1GGG1GGG1GGG1GGG1GGG1G11G111\n"
+            "001GGG1GG1GGG1GGG1GGG1GGG1GGG1G11G111\n"
             "A000000000000000000000000000000000001\n"
             "B000000000000000000000000000000000001\n"
-            "0001GG1GG1GGG10001GGG1GGG1GGG1100e111\n"
+            "C001GG1GG1GGG10001GGG1GGG1GGG1100e111\n"
             "111111111111110001GGG1GGG1GGG11001111\n"
             "100000000000000000000000000000000e111\n"
             "100000000000000000000000000000000e111\n"
@@ -2149,6 +2149,15 @@ static void map_build_hypermart(GridMap* m, AgentManager* am) {
 }
 
 
+
+
+
+
+
+// (Map #3 제거됨)
+
+
+
 // #3: 8 agents + 900 parking slots
 // - 좌측 2차선 세로도로(x=2,3) + y=6,7 가로 2차선 피더 유지
 // - 스타트 영역을 10x4 → 16x6으로 '살짝' 확장
@@ -2290,6 +2299,11 @@ static void map_build_10agents_200slots(GridMap* m, AgentManager* am) {
         m->grid[y][3].is_goal = FALSE;
     }
 }
+
+
+
+
+
 
 // ──────────────────────────────────────────────────────────────
 // 1-차선 주차블록 + 1-칸 링도로 + 격자도로로의 연결(가까운 격자선에 스냅)
@@ -2433,6 +2447,16 @@ static void map_build_biggrid_onegoal(GridMap* m, AgentManager* am) {
             if (m->grid[y][x].is_goal && m->num_goals < MAX_GOALS)
                 m->goals[m->num_goals++] = &m->grid[y][x];
 }
+
+
+
+
+
+
+
+
+
+
 
 // #5: 십자가 맵 (Cross) - 중앙 충전소, 각 팔 끝에 에이전트, 각 에이전트에서 4칸 진행 지점에 주차칸
 static void map_build_cross_4agents(GridMap* m, AgentManager* am) {
